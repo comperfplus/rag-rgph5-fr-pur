@@ -1,6 +1,7 @@
 """Assistant RGPH-5 : RAG français, audio et historique persistant dans Supabase."""
 
 import logging
+import json
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -200,45 +201,73 @@ def retrieve(question):
 
 def answer_question(question):
     passages = retrieve(question)
-    context = "\n\n".join(
-        f"[Source : {item['source']}, page {item['page']}]\n{item['text']}"
+    context = "\\n\\n".join(
+        f"[Source : {item['source']}, page {item['page']}]\\n{item['text']}"
         for item in passages
     )
 
     response = client.chat.completions.create(
         model=LLM_MODEL,
         temperature=0,
+        response_format={"type": "json_object"},
         messages=[
             {
                 "role": "system",
                 "content": (
                     "Tu es un assistant statistique spécialisé dans le RGPH-5 "
                     "du Sénégal. Réponds en français, clairement et de manière "
-                    "pédagogique. Utilise uniquement le contexte documentaire. "
+                    "pédagogique. Utilise exclusivement le contexte documentaire fourni. "
                     "N'invente aucun chiffre, aucune date ni aucun résultat. "
-                    "Si l'information manque, indique-le explicitement. "
+                    "Si le contexte ne contient pas l'information demandée, ou s'il "
+                    "ne permet pas de répondre de façon suffisamment fiable, indique "
+                    "clairement que l'information n'a pas été trouvée dans les documents. "
+                    "Dans ce cas, le statut doit être exactement 'not_found'. "
+                    "Si le contexte permet de répondre, le statut doit être exactement "
+                    "'success'. Une absence d'information n'est jamais une erreur technique. "
                     "Cite les sources sous la forme [document, page X]. "
-                    "Signale les éventuelles contradictions entre les sources."
+                    "Signale les éventuelles contradictions entre les sources. "
+                    "Retourne uniquement un objet JSON valide avec deux propriétés : "
+                    "'status' (valeur 'success' ou 'not_found') et 'answer' "
+                    "(la réponse destinée à l'utilisateur)."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Contexte documentaire :\n{context}\n\n"
+                    f"Contexte documentaire :\\n{context}\\n\\n"
                     f"Question : {question}"
                 ),
             },
         ],
     )
 
-    answer = (response.choices[0].message.content or "").strip()
+    raw_content = response.choices[0].message.content or "{}"
+    try:
+        result = json.loads(raw_content)
+        answer = str(result.get("answer", "")).strip()
+        status = result.get("status", "not_found")
+        if status not in ("success", "not_found"):
+            status = "not_found"
+        if not answer:
+            answer = (
+                "Je n'ai pas trouvé d'information suffisamment fiable "
+                "pour répondre à cette question dans les documents disponibles."
+            )
+            status = "not_found"
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        logger.exception("La réponse du modèle n'a pas respecté le format JSON attendu.")
+        answer = (
+            "Je n'ai pas pu déterminer de réponse fiable à partir des documents disponibles."
+        )
+        status = "not_found"
+
     sources = "; ".join(
         sorted({
             f"{item['source']} - page {item['page']}"
             for item in passages
         })
     )
-    return answer, sources
+    return answer, sources, status
 
 
 # ---------------------------------------------------------------------
@@ -283,10 +312,10 @@ def process_question(text_question=None, audio_path=None):
 
     try:
         question = transcribe_audio(audio_path) if audio_path else text_question
-        answer, sources = answer_question(question)
+        answer, sources, status = answer_question(question)
 
         try:
-            save_interaction(question, answer, mode, sources, "success")
+            save_interaction(question, answer, mode, sources, status)
         except Exception:
             logger.exception("La réponse a été générée, mais son enregistrement Supabase a échoué.")
 
