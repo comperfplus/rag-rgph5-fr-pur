@@ -4,3 +4,5 @@ numpy>=1.26.0
 tiktoken>=0.8.0
 pypdf>=5.0.0
 python-dotenv>=1.0.1
+openpyxl>=3.1.5
+supabase>=2.0.0
