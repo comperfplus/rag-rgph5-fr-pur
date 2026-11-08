@@ -1,6 +1,8 @@
 """Assistant RGPH-5 : RAG français, audio et historique persistant dans Supabase."""
 
 import logging
+import mimetypes
+import json
 import json
 import os
 import tempfile
@@ -11,7 +13,8 @@ import gradio as gr
 import numpy as np
 import tiktoken
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from pypdf import PdfReader
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
@@ -28,22 +31,22 @@ load_dotenv(BASE_DIR / ".env")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("assistant_rgph5")
 
-API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 
-if not API_KEY:
-    raise RuntimeError("Secret OPENAI_API_KEY manquant.")
+if not GEMINI_API_KEY:
+    raise RuntimeError("Secret GEMINI_API_KEY manquant.")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Secrets SUPABASE_URL et SUPABASE_KEY manquants.")
 
-client = OpenAI(api_key=API_KEY, timeout=120.0)
+client = genai.Client(api_key=GEMINI_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-LLM_MODEL = "gpt-4o-mini"
-TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+EMBEDDING_MODEL = "gemini-embedding-2"
+LLM_MODEL = "gemini-3.8-flash"
+TRANSCRIPTION_MODEL = "gemini-3.8-flash"
 CHUNK_SIZE = 450
 CHUNK_OVERLAP = 70
 TOP_K = 5
@@ -172,13 +175,15 @@ def build_chunks():
 
 
 def embed(texts):
+    """Calcule les embeddings avec Gemini."""
     vectors = []
     for start in range(0, len(texts), 64):
-        response = client.embeddings.create(
+        batch = texts[start:start + 64]
+        response = client.models.embed_content(
             model=EMBEDDING_MODEL,
-            input=texts[start:start + 64],
+            contents=batch,
         )
-        vectors.extend(item.embedding for item in response.data)
+        vectors.extend(item.values for item in response.embeddings)
     return np.asarray(vectors, dtype=np.float32)
 
 
@@ -206,42 +211,41 @@ def answer_question(question):
         for item in passages
     )
 
-    response = client.chat.completions.create(
+    prompt = f"""
+Tu es un assistant statistique spécialisé dans le RGPH-5 du Sénégal.
+Réponds en français, clairement et de manière pédagogique.
+Utilise exclusivement le contexte documentaire fourni.
+N'invente aucun chiffre, aucune date ni aucun résultat.
+
+Si le contexte ne contient pas l'information demandée, ou ne permet pas
+de répondre de façon suffisamment fiable, indique que l'information
+n'a pas été trouvée dans les documents et choisis le statut "not_found".
+Si le contexte permet de répondre, choisis le statut "success".
+Une absence d'information n'est jamais une erreur technique.
+Cite les sources sous la forme [document, page X].
+Signale les éventuelles contradictions entre les sources.
+
+Retourne uniquement un objet JSON valide avec :
+- "status" : "success" ou "not_found"
+- "answer" : la réponse destinée à l'utilisateur
+
+CONTEXTE DOCUMENTAIRE :
+{context}
+
+QUESTION :
+{question}
+"""
+
+    response = client.models.generate_content(
         model=LLM_MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Tu es un assistant statistique spécialisé dans le RGPH-5 "
-                    "du Sénégal. Réponds en français, clairement et de manière "
-                    "pédagogique. Utilise exclusivement le contexte documentaire fourni. "
-                    "N'invente aucun chiffre, aucune date ni aucun résultat. "
-                    "Si le contexte ne contient pas l'information demandée, ou s'il "
-                    "ne permet pas de répondre de façon suffisamment fiable, indique "
-                    "clairement que l'information n'a pas été trouvée dans les documents. "
-                    "Dans ce cas, le statut doit être exactement 'not_found'. "
-                    "Si le contexte permet de répondre, le statut doit être exactement "
-                    "'success'. Une absence d'information n'est jamais une erreur technique. "
-                    "Cite les sources sous la forme [document, page X]. "
-                    "Signale les éventuelles contradictions entre les sources. "
-                    "Retourne uniquement un objet JSON valide avec deux propriétés : "
-                    "'status' (valeur 'success' ou 'not_found') et 'answer' "
-                    "(la réponse destinée à l'utilisateur)."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Contexte documentaire :\\n{context}\\n\\n"
-                    f"Question : {question}"
-                ),
-            },
-        ],
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+        ),
     )
 
-    raw_content = response.choices[0].message.content or "{}"
+    raw_content = response.text or "{}"
     try:
         result = json.loads(raw_content)
         answer = str(result.get("answer", "")).strip()
@@ -255,9 +259,10 @@ def answer_question(question):
             )
             status = "not_found"
     except (json.JSONDecodeError, TypeError, AttributeError):
-        logger.exception("La réponse du modèle n'a pas respecté le format JSON attendu.")
+        logger.exception("Gemini n'a pas retourné le JSON attendu.")
         answer = (
-            "Je n'ai pas pu déterminer de réponse fiable à partir des documents disponibles."
+            "Je n'ai pas pu déterminer une réponse fiable à partir "
+            "des documents disponibles."
         )
         status = "not_found"
 
@@ -275,6 +280,7 @@ def answer_question(question):
 # ---------------------------------------------------------------------
 
 def transcribe_audio(audio_path):
+    """Transcrit un audio français avec Gemini."""
     if not audio_path:
         raise ValueError("Aucun enregistrement audio fourni.")
 
@@ -288,14 +294,21 @@ def transcribe_audio(audio_path):
             "Veuillez le raccourcir ou le compresser."
         )
 
-    with path.open("rb") as audio_file:
-        result = client.audio.transcriptions.create(
-            model=TRANSCRIPTION_MODEL,
-            file=audio_file,
-            prompt=TRANSCRIPTION_PROMPT,
-        )
+    mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    audio_bytes = path.read_bytes()
 
-    transcription = (getattr(result, "text", "") or "").strip()
+    response = client.models.generate_content(
+        model=TRANSCRIPTION_MODEL,
+        contents=[
+            TRANSCRIPTION_PROMPT
+            + " Transcris fidèlement les paroles en français. "
+              "Retourne uniquement le texte prononcé, sans commentaire.",
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
+        config=types.GenerateContentConfig(temperature=0),
+    )
+
+    transcription = (response.text or "").strip()
     if not transcription:
         raise ValueError("Aucune parole n'a pu être transcrite.")
     return transcription

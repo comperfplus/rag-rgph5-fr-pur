@@ -1,8 +1,8 @@
-gradio==5.23.1
-openai>=1.68.0
-numpy>=1.26.0
-tiktoken>=0.8.0
-pypdf>=5.0.0
-python-dotenv>=1.0.1
-openpyxl>=3.1.5
-supabase>=2.0.0
+gradio
+numpy
+tiktoken
+python-dotenv
+pypdf
+openpyxl
+supabase
+google-genai

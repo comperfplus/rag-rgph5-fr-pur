@@ -1,40 +1,29 @@
-# Assistant RGPH-5 – Supabase
+# Assistant RGPH-5 — version Gemini
 
-## Structure
-- `app.py` : assistant Gradio, RAG, transcription audio, historique Supabase et export Excel.
-- `requirements.txt` : dépendances Python.
-- `supabase_schema.sql` : script de création de la table.
-- `folder_rag/` : déposer ici les PDF RGPH-5.
+## Modifications
+- Génération des réponses : Gemini (`gemini-3.8-flash`)
+- Embeddings : Gemini (`gemini-embedding-2`)
+- Transcription audio : Gemini (`gemini-3.8-flash`)
+- Historique Supabase conservé
+- Statuts `success`, `not_found` et `error` conservés
+- Interface Gradio et lecture des PDF conservées
 
-## 1. Configurer Supabase
-1. Créer un projet sur https://supabase.com/
-2. Ouvrir SQL Editor.
-3. Exécuter le contenu de `supabase_schema.sql`.
-4. Dans Project Settings > API, récupérer l'URL du projet et une clé secrète (service_role/secret).
-5. Ne jamais publier cette clé dans GitHub ou dans le navigateur.
+## Variables Render
+Conserver les variables :
+- `SUPABASE_URL`
+- `SUPABASE_KEY`
+- `ADMIN_PASSWORD`
 
-## 2. Variables d'environnement Render
-Ajouter dans Environment :
-- `OPENAI_API_KEY` : clé API OpenAI.
-- `SUPABASE_URL` : URL du projet Supabase.
-- `SUPABASE_KEY` : clé secrète Supabase côté serveur (service_role/secret).
-- `ADMIN_PASSWORD` : mot de passe fort pour l'onglet Administration.
+Remplacer `OPENAI_API_KEY` par :
+- `GEMINI_API_KEY` : clé API obtenue depuis Google AI Studio
 
-## 3. Déploiement Render
-Build Command : `pip install -r requirements.txt`
-Start Command : `python app.py`
+## Déploiement
+1. Remplacer `app.py` et `requirements.txt` dans le dépôt GitHub.
+2. Dans Render > Environment, ajouter `GEMINI_API_KEY`.
+3. Vérifier les trois variables Supabase et `ADMIN_PASSWORD`.
+4. Supprimer `OPENAI_API_KEY` si elle n'est plus utilisée.
+5. Commit/push puis attendre le redéploiement Render.
 
-Le port est lu depuis la variable `PORT` fournie par Render.
-
-## 4. Fonctionnalités
-- Questions écrites et audio en français.
-- Réponses fondées sur les PDF et références documentaires.
-- Enregistrement durable des questions, réponses, sources, dates et statuts dans Supabase.
-- Consultation de l'historique avec mot de passe administrateur.
-- Export Excel des interactions.
-
-## Sécurité et confidentialité
-- La clé Supabase secrète ne doit jamais être intégrée au code côté navigateur ni publiée.
-- L'accès à l'historique est protégé dans l'interface par `ADMIN_PASSWORD`.
-- Informer les utilisateurs de la collecte des questions et réponses et définir une durée de conservation adaptée.
-- Pour un usage institutionnel, renforcer l'administration avec une authentification dédiée plutôt qu'un simple mot de passe partagé.
+Les PDF doivent rester dans le dossier `folder_rag/` du dépôt.
+La clé Gemini ne doit jamais être enregistrée dans GitHub ni partagée.
+Les quotas et éventuels coûts dépendent du compte Google AI Studio et du modèle accessible.
