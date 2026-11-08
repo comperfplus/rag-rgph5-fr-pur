@@ -3,8 +3,11 @@
 import logging
 import mimetypes
 import json
-import json
 import os
+import re
+import math
+import time
+from collections import Counter
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,17 +47,16 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-EMBEDDING_MODEL = "gemini-embedding-2"
-LLM_MODEL = "gemini-3.8-flash"
+LLM_MODEL = "gemini-3.5-flash-lite"
 TRANSCRIPTION_MODEL = "gemini-3.8-flash"
-CHUNK_SIZE = 450
-CHUNK_OVERLAP = 70
-TOP_K = 5
+CHUNK_SIZE = 350
+CHUNK_OVERLAP = 50
+TOP_K = 3
 MAX_AUDIO_SIZE_MB = 25
 
 TRANSCRIPTION_PROMPT = (
-    "Enregistrement en français sur le Recensement général de la population "
-    "et de l'habitat du Sénégal (RGPH-5), les ménages, la population, "
+    "Enregistrement en français sur les Recensement de la population "
+    "et de l'habitat du Sénégal (RGPH), les ménages, la population, "
     "les régions, les départements, les communes et les statistiques de l'ANSD."
 )
 
@@ -125,7 +127,7 @@ def create_excel_export(rows):
 
 
 # ---------------------------------------------------------------------
-# INDEXATION PDF ET RAG
+# INDEXATION PDF ET RECHERCHE BM25 LOCALE
 # ---------------------------------------------------------------------
 
 def build_chunks():
@@ -174,56 +176,128 @@ def build_chunks():
     return chunks
 
 
-def embed(texts):
-    """Calcule les embeddings avec Gemini."""
-    vectors = []
-    for start in range(0, len(texts), 64):
-        batch = texts[start:start + 64]
-        response = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=batch,
-        )
-        vectors.extend(item.values for item in response.embeddings)
-    return np.asarray(vectors, dtype=np.float32)
+def tokenize(text):
+    """Tokenisation locale simple, adaptée aux questions en français."""
+    return re.findall(r"[a-zàâçéèêëîïôûùüÿñæœ0-9]+", (text or "").lower())
 
 
-logger.info("Indexation des documents PDF...")
+def build_bm25_index(documents):
+    """Construit un index BM25 local sans appel réseau ni embedding distant."""
+    tokenized = [tokenize(item["text"]) for item in documents]
+    doc_lengths = [len(tokens) for tokens in tokenized]
+    avgdl = sum(doc_lengths) / max(len(doc_lengths), 1)
+
+    document_frequency = Counter()
+    for tokens in tokenized:
+        document_frequency.update(set(tokens))
+
+    total_docs = len(tokenized)
+    idf = {
+        term: math.log(1 + (total_docs - freq + 0.5) / (freq + 0.5))
+        for term, freq in document_frequency.items()
+    }
+    term_frequencies = [Counter(tokens) for tokens in tokenized]
+
+    return {
+        "lengths": doc_lengths,
+        "avgdl": avgdl,
+        "idf": idf,
+        "tf": term_frequencies,
+    }
+
+
+logger.info("Extraction et indexation locale des documents PDF...")
+index_start = time.perf_counter()
 corpus = build_chunks()
-corpus_vectors = embed([item["text"] for item in corpus])
-logger.info("Index RAG prêt : %d segments", len(corpus))
+bm25_index = build_bm25_index(corpus)
+logger.info(
+    "Index BM25 prêt : %d segments en %.2f secondes",
+    len(corpus),
+    time.perf_counter() - index_start,
+)
 
 
 def retrieve(question):
-    query_vector = embed([question])[0]
-    norms = (
-        np.linalg.norm(corpus_vectors, axis=1)
-        * np.linalg.norm(query_vector)
-    )
-    scores = np.dot(corpus_vectors, query_vector) / np.maximum(norms, 1e-12)
-    indices = np.argsort(scores)[::-1][:TOP_K]
-    return [corpus[int(index)] for index in indices]
+    """Recherche lexicale locale BM25, sans appel Gemini pour les embeddings."""
+    query_terms = tokenize(question)
+    if not query_terms:
+        return []
+
+    k1 = 1.5
+    b = 0.75
+    avgdl = bm25_index["avgdl"] or 1.0
+    scores = []
+
+    for idx, term_counts in enumerate(bm25_index["tf"]):
+        doc_len = bm25_index["lengths"][idx]
+        score = 0.0
+
+        for term in query_terms:
+            frequency = term_counts.get(term, 0)
+            if frequency == 0:
+                continue
+
+            idf_value = bm25_index["idf"].get(term, 0.0)
+            denominator = frequency + k1 * (
+                1 - b + b * doc_len / avgdl
+            )
+            score += idf_value * (
+                frequency * (k1 + 1) / denominator
+            )
+
+        scores.append(score)
+
+    best_indices = sorted(
+        range(len(scores)),
+        key=lambda i: scores[i],
+        reverse=True,
+    )[:TOP_K]
+
+    return [
+        corpus[i]
+        for i in best_indices
+        if scores[i] > 0
+    ]
 
 
 def answer_question(question):
+    """Recherche locale puis génération de réponse avec Gemini Flash-Lite."""
+    total_start = time.perf_counter()
+
+    retrieval_start = time.perf_counter()
     passages = retrieve(question)
-    context = "\\n\\n".join(
-        f"[Source : {item['source']}, page {item['page']}]\\n{item['text']}"
+    retrieval_seconds = time.perf_counter() - retrieval_start
+
+    if not passages:
+        answer = (
+            "Je n'ai pas trouvé de passage correspondant à cette question "
+            "dans les documents RGPH-5 disponibles."
+        )
+        logger.info(
+            "PERFORMANCE question | recherche_locale=%.2fs | Gemini=0.00s "
+            "| total=%.2fs | passages=0",
+            retrieval_seconds,
+            time.perf_counter() - total_start,
+        )
+        return answer, "", "not_found"
+
+    context = "\n\n".join(
+        f"[Source : {item['source']}, page {item['page']}]\n{item['text']}"
         for item in passages
     )
 
     prompt = f"""
 Tu es un assistant statistique spécialisé dans le RGPH-5 du Sénégal.
-Réponds en français, clairement et de manière pédagogique.
+Réponds en français, clairement et de manière concise.
 Utilise exclusivement le contexte documentaire fourni.
 N'invente aucun chiffre, aucune date ni aucun résultat.
 
-Si le contexte ne contient pas l'information demandée, ou ne permet pas
-de répondre de façon suffisamment fiable, indique que l'information
-n'a pas été trouvée dans les documents et choisis le statut "not_found".
+Si le contexte ne permet pas de répondre de façon suffisamment fiable,
+indique que l'information n'a pas été trouvée et choisis le statut "not_found".
 Si le contexte permet de répondre, choisis le statut "success".
 Une absence d'information n'est jamais une erreur technique.
 Cite les sources sous la forme [document, page X].
-Signale les éventuelles contradictions entre les sources.
+Signale les contradictions éventuelles entre les sources.
 
 Retourne uniquement un objet JSON valide avec :
 - "status" : "success" ou "not_found"
@@ -236,28 +310,34 @@ QUESTION :
 {question}
 """
 
+    generation_start = time.perf_counter()
     response = client.models.generate_content(
         model=LLM_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=0,
+            max_output_tokens=700,
             response_mime_type="application/json",
         ),
     )
+    generation_seconds = time.perf_counter() - generation_start
 
     raw_content = response.text or "{}"
     try:
         result = json.loads(raw_content)
         answer = str(result.get("answer", "")).strip()
         status = result.get("status", "not_found")
+
         if status not in ("success", "not_found"):
             status = "not_found"
+
         if not answer:
             answer = (
                 "Je n'ai pas trouvé d'information suffisamment fiable "
                 "pour répondre à cette question dans les documents disponibles."
             )
             status = "not_found"
+
     except (json.JSONDecodeError, TypeError, AttributeError):
         logger.exception("Gemini n'a pas retourné le JSON attendu.")
         answer = (
@@ -271,6 +351,15 @@ QUESTION :
             f"{item['source']} - page {item['page']}"
             for item in passages
         })
+    )
+
+    logger.info(
+        "PERFORMANCE question | recherche_locale=%.2fs | Gemini=%.2fs "
+        "| total=%.2fs | passages=%d",
+        retrieval_seconds,
+        generation_seconds,
+        time.perf_counter() - total_start,
+        len(passages),
     )
     return answer, sources, status
 
@@ -324,7 +413,16 @@ def process_question(text_question=None, audio_path=None):
     question = ""
 
     try:
-        question = transcribe_audio(audio_path) if audio_path else text_question
+        processing_start = time.perf_counter()
+        if audio_path:
+            transcription_start = time.perf_counter()
+            question = transcribe_audio(audio_path)
+            logger.info(
+                "PERFORMANCE transcription Gemini=%.2fs",
+                time.perf_counter() - transcription_start,
+            )
+        else:
+            question = text_question
         answer, sources, status = answer_question(question)
 
         try:
@@ -332,6 +430,10 @@ def process_question(text_question=None, audio_path=None):
         except Exception:
             logger.exception("La réponse a été générée, mais son enregistrement Supabase a échoué.")
 
+        logger.info(
+            "PERFORMANCE traitement complet=%.2fs",
+            time.perf_counter() - processing_start,
+        )
         return question, answer
 
     except ValueError as error:
@@ -415,7 +517,7 @@ footer { visibility: hidden; }
 """
 
 with gr.Blocks(
-    title="Assistant statistique RGPH-5",
+    title="Assistant statistique RGPH",
     css=CSS,
     theme=gr.themes.Soft(),
 ) as demo:
@@ -433,7 +535,7 @@ with gr.Blocks(
     with gr.Tab("Question écrite"):
         text_input = gr.Textbox(
             label="Votre question",
-            placeholder="Ex. Quelle est la population du Sénégal selon le RGPH-5 ?",
+            placeholder="Ex. Quelle est la population du Sénégal selon le RGPH de 2023 ?",
             lines=3,
         )
         text_button = gr.Button("Envoyer", variant="primary")
