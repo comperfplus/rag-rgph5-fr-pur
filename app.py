@@ -67,7 +67,7 @@ TRANSCRIPTION_PROMPT = (
 TABLE_NAME = "historique_interactions"
 
 
-def save_interaction(question, answer, mode, sources="", status="success"):
+def save_interaction(question, answer, mode, sources="", status="success", duration_traitment=0.0):
     """Enregistre une interaction durablement dans Supabase."""
     payload = {
         "date_question": datetime.now(timezone.utc).isoformat(),
@@ -76,6 +76,7 @@ def save_interaction(question, answer, mode, sources="", status="success"):
         "reponse": answer or "",
         "sources": sources or "",
         "statut": status,
+        "duration_traitment": round(float(duration_traitment), 3),
     }
     result = supabase.table(TABLE_NAME).insert(payload).execute()
     return result
@@ -287,7 +288,7 @@ def answer_question(question):
     )
 
     prompt = f"""
-Tu es un assistant statistique spécialisé dans le RGPH-5 du Sénégal.
+Tu es un assistant statistique spécialisé dans les recensements du Sénégal.
 Réponds en français, clairement et de manière concise.
 Utilise exclusivement le contexte documentaire fourni.
 N'invente aucun chiffre, aucune date ni aucun résultat.
@@ -411,9 +412,9 @@ def process_question(text_question=None, audio_path=None):
 
     mode = "audio" if audio_path else "texte"
     question = ""
+    processing_start = time.perf_counter()
 
     try:
-        processing_start = time.perf_counter()
         if audio_path:
             transcription_start = time.perf_counter()
             question = transcribe_audio(audio_path)
@@ -424,9 +425,13 @@ def process_question(text_question=None, audio_path=None):
         else:
             question = text_question
         answer, sources, status = answer_question(question)
+        duration_traitment = time.perf_counter() - processing_start
 
         try:
-            save_interaction(question, answer, mode, sources, status)
+            save_interaction(
+                question, answer, mode, sources, status,
+                duration_traitment=duration_traitment,
+            )
         except Exception:
             logger.exception("La réponse a été générée, mais son enregistrement Supabase a échoué.")
 
@@ -437,8 +442,12 @@ def process_question(text_question=None, audio_path=None):
         return question, answer
 
     except ValueError as error:
+        duration_traitment = time.perf_counter() - processing_start
         try:
-            save_interaction(question or text_question, str(error), mode, "", "error")
+            save_interaction(
+                question or text_question, str(error), mode, "", "error",
+                duration_traitment=duration_traitment,
+            )
         except Exception:
             logger.exception("Impossible d'enregistrer l'erreur dans Supabase.")
         return question or "", str(error)
@@ -449,8 +458,12 @@ def process_question(text_question=None, audio_path=None):
             "Une erreur technique est survenue. "
             "Veuillez réessayer dans quelques instants."
         )
+        duration_traitment = time.perf_counter() - processing_start
         try:
-            save_interaction(question or text_question, message, mode, "", "error")
+            save_interaction(
+                question or text_question, message, mode, "", "error",
+                duration_traitment=duration_traitment,
+            )
         except Exception:
             logger.exception("Impossible d'enregistrer l'erreur dans Supabase.")
         return question or "", message
@@ -517,13 +530,13 @@ footer { visibility: hidden; }
 """
 
 with gr.Blocks(
-    title="Assistant statistique RGPH",
+    title="STATSENEGAL - GPT",
     css=CSS,
     theme=gr.themes.Soft(),
 ) as demo:
     gr.Markdown(
         """
-        # Assistant statistique – RGPH-5
+        # Assistant statistique – RGPH
 
         Posez vos questions sur les résultats du Recensement général
         de la population et de l'habitat du Sénégal.
