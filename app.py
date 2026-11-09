@@ -3,6 +3,7 @@
 import logging
 import mimetypes
 import json
+import html
 import os
 import re
 import math
@@ -67,7 +68,11 @@ TRANSCRIPTION_PROMPT = (
 TABLE_NAME = "historique_interactions"
 
 
-def save_interaction(question, answer, mode, sources="", status="success", duration_traitment=0.0):
+def save_interaction(
+    question, answer, mode, sources="", status="success",
+    duration_traitment=0.0, llm_modele_name=LLM_MODEL,
+    transcript_modele_name=""
+):
     """Enregistre une interaction durablement dans Supabase."""
     payload = {
         "date_question": datetime.now(timezone.utc).isoformat(),
@@ -77,6 +82,8 @@ def save_interaction(question, answer, mode, sources="", status="success", durat
         "sources": sources or "",
         "statut": status,
         "duration_traitment": round(float(duration_traitment), 3),
+        "llm_modele_name": llm_modele_name or "",
+        "transcript_modele_name": transcript_modele_name or "",
     }
     result = supabase.table(TABLE_NAME).insert(payload).execute()
     return result
@@ -86,7 +93,8 @@ def get_history_rows(limit=5000):
     """Récupère les dernières interactions depuis Supabase."""
     result = (
         supabase.table(TABLE_NAME)
-        .select("date_question,type_question,question,reponse,sources,statut")
+        .select("date_question,type_question,question,reponse,sources,statut,"
+                "duration_traitment,llm_modele_name,transcript_modele_name")
         .order("date_question", desc=True)
         .limit(limit)
         .execute()
@@ -98,7 +106,8 @@ def create_excel_export(rows):
     """Génère un fichier Excel à partir des interactions."""
     headers = [
         "date_question", "type_question", "question",
-        "reponse", "sources", "statut"
+        "reponse", "sources", "statut", "duration_traitment",
+        "llm_modele_name", "transcript_modele_name"
     ]
     workbook = Workbook()
     sheet = workbook.active
@@ -112,7 +121,8 @@ def create_excel_export(rows):
     for row in reversed(rows):
         sheet.append([row.get(column, "") or "" for column in headers])
 
-    widths = {"A": 25, "B": 16, "C": 55, "D": 75, "E": 55, "F": 14}
+    widths = {"A": 25, "B": 16, "C": 55, "D": 75, "E": 55,
+              "F": 14, "G": 20, "H": 28, "I": 30}
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
 
@@ -261,6 +271,17 @@ def retrieve(question):
     ]
 
 
+def format_answer_for_display(answer, status):
+    """Affiche les réponses valides en bleu et les absences/erreurs en rouge."""
+    safe_answer = html.escape(str(answer or "")).replace("\\n", "<br>")
+    color = "#1565C0" if status == "success" else "#D32F2F"
+    return (
+        f'<div style="color:{color}; font-weight:700;">'
+        f'<strong>Réponses:</strong><br>{safe_answer.replace(chr(10), "<br>")}'
+        '</div>'
+    )
+
+
 def answer_question(question):
     """Recherche locale puis génération de réponse avec Gemini Flash-Lite."""
     total_start = time.perf_counter()
@@ -345,7 +366,7 @@ QUESTION :
             "Je n'ai pas pu déterminer une réponse fiable à partir "
             "des documents disponibles."
         )
-        status = "not_found"
+        status = "error"
 
     sources = "; ".join(
         sorted({
@@ -408,7 +429,7 @@ def process_question(text_question=None, audio_path=None):
     text_question = (text_question or "").strip()
 
     if bool(text_question) == bool(audio_path):
-        return "", "Choisissez un seul mode : texte OU audio."
+        return "", format_answer_for_display("Choisissez un seul mode : texte OU audio.", "error")
 
     mode = "audio" if audio_path else "texte"
     question = ""
@@ -431,6 +452,8 @@ def process_question(text_question=None, audio_path=None):
             save_interaction(
                 question, answer, mode, sources, status,
                 duration_traitment=duration_traitment,
+                llm_modele_name=LLM_MODEL,
+                transcript_modele_name=TRANSCRIPTION_MODEL if mode == "audio" else "",
             )
         except Exception:
             logger.exception("La réponse a été générée, mais son enregistrement Supabase a échoué.")
@@ -439,7 +462,7 @@ def process_question(text_question=None, audio_path=None):
             "PERFORMANCE traitement complet=%.2fs",
             time.perf_counter() - processing_start,
         )
-        return question, answer
+        return question, format_answer_for_display(answer, status)
 
     except ValueError as error:
         duration_traitment = time.perf_counter() - processing_start
@@ -447,10 +470,12 @@ def process_question(text_question=None, audio_path=None):
             save_interaction(
                 question or text_question, str(error), mode, "", "error",
                 duration_traitment=duration_traitment,
+                llm_modele_name=LLM_MODEL,
+                transcript_modele_name=TRANSCRIPTION_MODEL if mode == "audio" else "",
             )
         except Exception:
             logger.exception("Impossible d'enregistrer l'erreur dans Supabase.")
-        return question or "", str(error)
+        return question or "", format_answer_for_display(str(error), "error")
 
     except Exception:
         logger.exception("Erreur pendant le traitement de la question.")
@@ -463,10 +488,12 @@ def process_question(text_question=None, audio_path=None):
             save_interaction(
                 question or text_question, message, mode, "", "error",
                 duration_traitment=duration_traitment,
+                llm_modele_name=LLM_MODEL,
+                transcript_modele_name=TRANSCRIPTION_MODEL if mode == "audio" else "",
             )
         except Exception:
             logger.exception("Impossible d'enregistrer l'erreur dans Supabase.")
-        return question or "", message
+        return question or "", format_answer_for_display(message, "error")
 
 
 # ---------------------------------------------------------------------
@@ -490,6 +517,9 @@ def load_admin_history(password):
                 row.get("reponse", ""),
                 row.get("sources", ""),
                 row.get("statut", ""),
+                str(row.get("duration_traitment", "")),
+                row.get("llm_modele_name", ""),
+                row.get("transcript_modele_name", ""),
             ]
             for row in rows
         ]
@@ -536,24 +566,24 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-        # Assistant statistique – RGPH
+        # Assistant statistique(STATSENEGAL - GPT) – RGPH
 
-        Posez vos questions sur les résultats du Recensement général
+        Posez vos questions sur les résultats des Recensements généraux
         de la population et de l'habitat du Sénégal.
 
-        Vous pouvez écrire votre question ou l'enregistrer en français.
+        Vous pouvez écrire votre question ou l'enregistrer en audio ou charger l'audio.
         """
     )
 
     with gr.Tab("Question écrite"):
         text_input = gr.Textbox(
             label="Votre question",
-            placeholder="Ex. Quelle est la population du Sénégal selon le RGPH de 2023 ?",
+            placeholder="Ex. Quelle est la population du Sénégal en 2023 ?",
             lines=3,
         )
         text_button = gr.Button("Envoyer", variant="primary")
         text_question_output = gr.Textbox(label="Question traitée", interactive=False)
-        text_answer_output = gr.Markdown()
+        text_answer_output = gr.HTML()
         text_button.click(
             fn=lambda question: process_question(text_question=question),
             inputs=text_input,
@@ -564,7 +594,7 @@ with gr.Blocks(
         audio_input = gr.Audio(
             sources=["microphone", "upload"],
             type="filepath",
-            label="Enregistrez votre question en français",
+            label="Enregistrez votre question",
         )
         audio_button = gr.Button("Transcrire et envoyer", variant="primary")
         audio_question_output = gr.Textbox(
@@ -572,7 +602,7 @@ with gr.Blocks(
             lines=3,
             interactive=False,
         )
-        audio_answer_output = gr.Markdown()
+        audio_answer_output = gr.HTML()
         audio_button.click(
             fn=lambda audio: process_question(audio_path=audio),
             inputs=audio_input,
@@ -599,9 +629,10 @@ with gr.Blocks(
         admin_status = gr.Markdown()
         history_table = gr.Dataframe(
             headers=[
-                "Date/heure", "Type", "Question", "Réponse", "Sources", "Statut"
+                "Date/heure", "Type", "Question", "Réponse", "Sources",
+                "Statut", "Durée (s)", "Modèle LLM", "Modèle transcription"
             ],
-            datatype=["str", "str", "str", "str", "str", "str"],
+            datatype=["str", "str", "str", "str", "str", "str", "number", "str", "str"],
             interactive=False,
             wrap=True,
             label="Historique des questions et réponses",
