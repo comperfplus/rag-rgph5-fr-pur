@@ -8,6 +8,7 @@ import os
 import re
 import math
 import time
+import unicodedata
 from collections import Counter
 import tempfile
 from datetime import datetime, timezone
@@ -186,10 +187,21 @@ def build_chunks():
         )
     return chunks
 
+#Ajout d'une fonction de normalisation
+def normalize_text(text):
+    """Normalise le texte : minuscules, accents supprimés et espaces nettoyés."""
+    text = (text or "").lower().strip()
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(
+        character for character in text
+        if not unicodedata.combining(character)
+    )
+
 
 def tokenize(text):
-    """Tokenisation locale simple, adaptée aux questions en français."""
-    return re.findall(r"[a-zàâçéèêëîïôûùüÿñæœ0-9]+", (text or "").lower())
+    """Tokenisation BM25 tolérante aux accents, pour documents et questions."""
+    normalized = normalize_text(text)
+    return re.findall(r"[a-z0-9]+", normalized)
 
 
 def build_bm25_index(documents):
@@ -566,7 +578,7 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-        # Assistant statistique(STATSENEGAL - GPT) – RGPH
+        # Assistant statistique RGPH (STATSENEGAL - GPT)
 
         Posez vos questions sur les résultats des Recensements généraux
         de la population et de l'habitat du Sénégal.
