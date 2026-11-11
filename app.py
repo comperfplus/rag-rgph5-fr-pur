@@ -578,7 +578,7 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-        # Assistant statistique RGPH (STATSENEGAL - GPT)
+        # Assistant statistique RGPH (STATSENEGAL - GPT) V2.2
 
         Posez vos questions sur les résultats des Recensements généraux
         de la population et de l'habitat du Sénégal.
